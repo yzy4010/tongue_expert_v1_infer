@@ -11,6 +11,8 @@ import torch.nn.functional as F
 
 from src.utils.mask_ops import fuse_by_priority
 
+from pathlib import Path
+
 NUM_CLASSES = 6
 
 
@@ -115,22 +117,30 @@ class RoiSeg6ClassInfer:
         self.model = model_builder(NUM_CLASSES).to(self.device).eval()
         self._load_weights(cfg.ckpt_path)
 
-    def _load_weights(self, ckpt_path: str) -> None:
-        if not os.path.exists(ckpt_path):
+    def _load_weights(self, ckpt_path) -> None:
+        # 1) normalize type
+        ckpt_path = Path(ckpt_path)
+
+        # 2) normalize relative -> absolute (repo root)
+        if not ckpt_path.is_absolute():
+            # 这个文件在 src/pipeline/stages/ 下：parents[3] = repo root
+            PROJECT_ROOT = Path(__file__).resolve().parents[3]
+            ckpt_path = (PROJECT_ROOT / ckpt_path).resolve()
+
+        # 3) existence check
+        if not ckpt_path.exists():
             raise FileNotFoundError(f"ROI seg checkpoint not found: {ckpt_path}")
 
-        ckpt = torch.load(ckpt_path, map_location="cpu")
+        ckpt = torch.load(str(ckpt_path), map_location="cpu")
         state = _unwrap_state_dict(ckpt)
-
-        # Strip common prefixes
         state = _strip_prefix(state, prefixes=("module.", "model.", "net."))
 
-        # Use strict=False to reduce friction; you can switch to strict=True once aligned.
         missing, unexpected = self.model.load_state_dict(state, strict=False)
         if missing:
             print(f"[ROI-SEG] missing keys (showing up to 12): {missing[:12]}{'...' if len(missing) > 12 else ''}")
         if unexpected:
-            print(f"[ROI-SEG] unexpected keys (showing up to 12): {unexpected[:12]}{'...' if len(unexpected) > 12 else ''}")
+            print(
+                f"[ROI-SEG] unexpected keys (showing up to 12): {unexpected[:12]}{'...' if len(unexpected) > 12 else ''}")
 
     def _preprocess(self, img_bgr: np.ndarray) -> Tuple[torch.Tensor, Tuple[int, int]]:
         if img_bgr is None or img_bgr.ndim != 3 or img_bgr.shape[2] != 3:

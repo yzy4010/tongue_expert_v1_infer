@@ -22,11 +22,11 @@ async def infer(file: UploadFile = File(...)):
         return {"error": "Invalid image"}
 
     # 2. 推理
-    bundle = load_bundle()
+    bundle = load_bundle()  # 如果你暂时还没改成全局缓存，就先这样；后面再优化
     result = infer_one_image(
-        bundle,
-        img_bgr,
-        sample_id="API_UPLOAD"
+        image=img_bgr,
+        bundle=bundle,
+        sample_id="API_UPLOAD",
     )
 
     # 3. 对外只返回 demo（推荐）

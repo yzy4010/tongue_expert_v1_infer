@@ -9,14 +9,19 @@ This module is responsible for:
 """
 
 from dataclasses import dataclass
-from pathlib import Path
 import torch
 import joblib
 
 # ===== imports from your existing project =====
 from src.models.unet import UNet
 from src.pipeline.stages.p20_roi_seg_6class import RoiSeg6ClassInfer, RoiSegConfig
-from scripts.infer_p14_embedding import P14MultiTaskNet
+# from scripts.infer_p14_embedding import P14MultiTaskNet
+from src.models.p14_multitask import P14MultiTaskNet
+from pathlib import Path
+
+# 项目根目录：.../tongue_expert_v1
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# build_bundle.py 在 src/pipeline/ 下，parents[0]=pipeline, [1]=src, [2]=repo root
 
 
 # -------------------------------------------------
@@ -58,22 +63,29 @@ class ModelBundle:
 # Main builder
 # -------------------------------------------------
 
+
 def build_model_bundle(device: str = "cpu") -> ModelBundle:
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
     # ===== paths =====
     paths = ModelPaths(
-        tongue_ckpt=Path("../checkpoints/seg/unet_tongue_best.pth"),
-        roi_ckpt=Path("../checkpoints/roi_seg/roi_seg_6class_v1_best.pth"),
-        p14_ckpt=Path("../checkpoints/p14/p14_multitask_best.pth"),
-        p14_pca=Path("../checkpoints/p14/p14_pca.pkl"),
-        p11_ckpt=Path("checkpoints/p11/p11_color_best.pth"),
-        p11_norm=Path("checkpoints/p11/p11_norm.npz"),  # 没有也没关系，下面会处理
-        p13_ckpt=Path("checkpoints/p13/p13_texture_best.pth"),
-        p13_norm=Path("checkpoints/p13/p13_norm.npz"),
+        tongue_ckpt=PROJECT_ROOT / "checkpoints" / "seg" / "unet_tongue_best.pth",
+        roi_ckpt=PROJECT_ROOT / "checkpoints" / "roi_seg" / "roi_seg_6class_v1_best.pth",
+        p14_ckpt=PROJECT_ROOT / "checkpoints" / "p14" / "p14_multitask_best.pth",
+        p14_pca=PROJECT_ROOT / "checkpoints" / "p14" / "p14_pca.pkl",
+
+        # 你说部署禁用 P11/P13 回归，但先把路径也统一；后面可以不加载它们
+        p11_ckpt=PROJECT_ROOT / "checkpoints" / "p11" / "p11_color_best.pth",
+        p11_norm=PROJECT_ROOT / "checkpoints" / "p11" / "p11_norm.npz",
+        p13_ckpt=PROJECT_ROOT / "checkpoints" / "p13" / "p13_texture_best.pth",
+        p13_norm=PROJECT_ROOT / "checkpoints" / "p13" / "p13_norm.npz",
     )
 
     # ===== 1. Tongue segmentation model =====
+
+    ckpt = Path(paths.tongue_ckpt)
+    if not ckpt.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt} (PROJECT_ROOT={PROJECT_ROOT})")
     tongue_model = UNet().to(device)
     tongue_model.load_state_dict(
         torch.load(paths.tongue_ckpt, map_location=device)
