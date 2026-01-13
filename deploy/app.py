@@ -5,8 +5,18 @@ import cv2
 
 from deploy.startup import load_bundle
 from src.pipeline.run_infer import infer_one_image
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
+
 
 app = FastAPI(title="TongueExpert API", version="v1")
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+OUTPUTS_DIR = PROJECT_ROOT / "outputs"
+
+app.mount("/static", StaticFiles(directory=str(OUTPUTS_DIR)), name="static")
+
+
 
 @app.on_event("startup")
 def _startup():

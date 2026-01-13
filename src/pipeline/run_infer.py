@@ -51,6 +51,34 @@ def _sigmoid_mask_from_logits(logits: torch.Tensor, thr: float = 0.5) -> np.ndar
 # =========================
 # ROI + shape helpers
 # =========================
+def _draw_roi_overlay(
+    img_bgr: np.ndarray,
+    mask_255: np.ndarray,
+    bbox: tuple,
+    alpha: float = 0.4,
+) -> np.ndarray:
+    """
+    在原图上绘制：
+    - 舌体 mask 半透明 overlay
+    - ROI bbox
+    """
+    overlay = img_bgr.copy()
+
+    # 红色 mask overlay
+    red = np.zeros_like(img_bgr)
+    red[:, :, 2] = 255  # BGR -> R
+    mask_bool = mask_255 > 0
+    overlay[mask_bool] = cv2.addWeighted(
+        img_bgr[mask_bool], 1 - alpha, red[mask_bool], alpha, 0
+    )
+
+    # ROI bbox
+    x1, y1, x2, y2 = bbox
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+    return overlay
+
+
 def _mask_to_bbox(mask_255: np.ndarray) -> Tuple[int, int, int, int]:
     ys, xs = np.where(mask_255 > 0)
     h, w = mask_255.shape[:2]
@@ -261,6 +289,35 @@ def infer_one_image(
     bbox = _mask_to_bbox(mask_255)
     roi_bgr = _crop_roi(img_bgr, bbox)
 
+    # ===== Save analysis images (input/mask/roi/overlay) =====
+    analysis_dir = out_root / "analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+
+    input_path = analysis_dir / f"{sample_id}_input.jpg"
+    mask_path = analysis_dir / f"{sample_id}_mask.png"
+    roi_path = analysis_dir / f"{sample_id}_roi.jpg"
+    overlay_path = analysis_dir / f"{sample_id}_roi_overlay.jpg"
+
+    # 保存原图
+    cv2.imencode(".jpg", img_bgr)[1].tofile(str(input_path))
+
+    # 保存 mask
+    cv2.imencode(".png", mask_255)[1].tofile(str(mask_path))
+
+    # 保存 ROI
+    cv2.imencode(".jpg", roi_bgr)[1].tofile(str(roi_path))
+
+    # 保存 overlay（需要你已有 _draw_roi_overlay）
+    overlay_img = _draw_roi_overlay(img_bgr, mask_255, bbox)
+    cv2.imencode(".jpg", overlay_img)[1].tofile(str(overlay_path))
+
+    # 生成相对路径（返回给接口）
+    # 生成前端友好 URL（配合 app.mount("/static", outputs_dir)）
+    input_url = f"/static/analysis/{sample_id}_input.jpg"
+    mask_url = f"/static/analysis/{sample_id}_mask.png"
+    roi_url = f"/static/analysis/{sample_id}_roi.jpg"
+    roi_overlay_url = f"/static/analysis/{sample_id}_roi_overlay.jpg"
+
     # 4) p14 embedding
     bundle.p14_model.eval()
     roi_rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
@@ -335,8 +392,15 @@ def infer_one_image(
         },
         "artifacts": {
             "generated": {
-                "roi_path": roi_path_rel,
-                "mask_path": mask_path_rel,
+                "input_url": input_url,
+                "mask_url": mask_url,
+                "roi_url": roi_url,
+                "roi_overlay_url": roi_overlay_url,
+                # 可选：保留本地相对路径用于调试
+                "input_path": str(input_path),
+                "mask_path": str(mask_path),
+                "roi_path": str(roi_path),
+                "roi_overlay_path": str(overlay_path),
             }
         },
         "outputs": {
