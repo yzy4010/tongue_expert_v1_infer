@@ -6,7 +6,8 @@ import torch
 import joblib
 
 from src.models.unet import UNet
-from scripts.infer_p14_embedding import P14MultiTaskNet  # 你现在用的 import 路径
+# from scripts.infer_p14_embedding import P14MultiTaskNet  # 你现在用的 import 路径
+from src.models.p14_multitask import P14MultiTaskNet
 from src.pipeline.stages.p20_roi_seg_6class import RoiSeg6ClassInfer, RoiSegConfig
 
 
