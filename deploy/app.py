@@ -13,7 +13,7 @@ app = FastAPI(title="TongueExpert API", version="v1")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 OUTPUTS_DIR = PROJECT_ROOT / "outputs"
-
+OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(OUTPUTS_DIR)), name="static")
 
 
