@@ -13,6 +13,9 @@ from src.utils.mask_ops import fuse_by_priority
 
 from pathlib import Path
 
+from src.pipeline.rule_fallback import ensure_tai_zhi
+
+
 NUM_CLASSES = 6
 
 
@@ -200,4 +203,5 @@ class RoiSeg6ClassInfer:
             tongue_mask=tongue_mask_base,
             fill_zhi_from_tongue=self.cfg.fill_zhi_from_tongue,
         )
+        roi_masks = ensure_tai_zhi(img_bgr, roi_masks)
         return roi_masks

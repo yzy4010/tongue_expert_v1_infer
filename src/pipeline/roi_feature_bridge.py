@@ -1,11 +1,11 @@
 # src/pipeline/roi_feature_bridge.py
-
 from __future__ import annotations
-from pathlib import Path
-import numpy as np
-import cv2
-from typing import Callable, Dict, List, Optional
 
+from pathlib import Path
+from typing import Callable, Dict, Optional, Tuple
+
+import cv2
+import numpy as np
 import torch
 
 
@@ -17,25 +17,46 @@ def replace_prefix(feats: Dict[str, float], old: str, new: str) -> Dict[str, flo
     """
     将特征字典中的 key 前缀从 old 替换为 new（只替换一次）
     """
-    return {k.replace(old, new, 1): v for k, v in feats.items()}
+    return {k.replace(old, new, 1): float(v) for k, v in feats.items()}
 
 
-def mask_area(mask: np.ndarray) -> int:
+def to_u8_mask(mask: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    """
+    Normalize mask to uint8 {0,255}. Accept {0,1} or bool or uint8.
+    """
+    if mask is None:
+        return None
+    m = mask
+    if m.dtype != np.uint8:
+        m = m.astype(np.uint8)
+    if m.max() <= 1:
+        m = m * 255
+    m = (m > 0).astype(np.uint8) * 255
+    return m
+
+
+def mask_area(mask: Optional[np.ndarray]) -> int:
+    if mask is None:
+        return 0
     return int((mask > 0).sum())
 
 
-def bbox_from_mask(mask: np.ndarray):
+def safe_ratio(num: int, den: int) -> float:
+    return float(num) / float(den) if den > 0 else 0.0
+
+
+def bbox_from_mask(mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
     ys, xs = np.where(mask > 0)
     if len(xs) == 0:
         return None
-    return xs.min(), ys.min(), xs.max(), ys.max()
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
 
 
 def crop_by_mask_bbox(
     img_bgr: np.ndarray,
     mask: np.ndarray,
     margin: float = 0.10,
-):
+) -> Optional[np.ndarray]:
     """
     用 mask 的 bbox 裁剪 ROI（给 P14 用）
     """
@@ -61,12 +82,12 @@ def crop_by_mask_bbox(
 
 def resize_keep_aspect_pad(
     img_bgr: np.ndarray,
-    out_hw=(224, 224),
-):
+    out_hw: Tuple[int, int] = (224, 224),
+) -> np.ndarray:
     oh, ow = out_hw
     h, w = img_bgr.shape[:2]
     scale = min(ow / w, oh / h)
-    nw, nh = int(w * scale), int(h * scale)
+    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
 
     resized = cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_LINEAR)
     canvas = np.zeros((oh, ow, 3), dtype=resized.dtype)
@@ -93,6 +114,7 @@ def run_regression_on_roi(
 ) -> Dict[str, float]:
     """
     通用回归入口（P11 / P13 共用）
+    注意：这里依赖 roi_dir 下已有该 ROI 的图片（你上游应已输出到 roi_root/roi_name）。
     """
     if not roi_dir.exists():
         return {}
@@ -124,7 +146,7 @@ def run_p14_on_roi(
     pca,
     new_prefix: str,
     device: str,
-    embed_hw=(224, 224),
+    embed_hw: Tuple[int, int] = (224, 224),
 ) -> Dict[str, float]:
     """
     ROI → embedding(128) → PCA → cnnPC1..10
@@ -135,7 +157,7 @@ def run_p14_on_roi(
     """
     crop = crop_by_mask_bbox(img_bgr, mask, margin=0.10)
     if crop is None:
-        return {f"{new_prefix}cnnPC{i}": np.nan for i in range(1, 11)}
+        return {f"{new_prefix}cnnPC{i}": float("nan") for i in range(1, 11)}
 
     crop_in = resize_keep_aspect_pad(crop, out_hw=embed_hw)
 
@@ -145,7 +167,6 @@ def run_p14_on_roi(
     x = torch.from_numpy(x).unsqueeze(0).to(device)     # 1x3xHxW
 
     with torch.no_grad():
-        # 推荐：你已添加 forward_embedding
         if hasattr(p14_model, "forward_embedding"):
             emb = p14_model.forward_embedding(x)        # (1, 128)
         else:
@@ -156,7 +177,6 @@ def run_p14_on_roi(
     pc = pca.transform(emb_np)[0]                       # (>=10,)
 
     return {f"{new_prefix}cnnPC{i}": float(pc[i - 1]) for i in range(1, 11)}
-
 
 
 # ============================================================
@@ -189,6 +209,7 @@ def extract_roi_features_all(
     pca,
 
     min_area: int = 200,
+    include_roi_stats: bool = True,
 ) -> Dict[str, Dict[str, float]]:
     """
     对单个样本，输出论文级表结构：
@@ -197,9 +218,43 @@ def extract_roi_features_all(
     P31_Zhi_Color / P33_Zhi_Texture / P34_Zhi_CNN
     P41_Fissure_Color / P43_Fissure_Texture / P44_Fissure_CNN
     P51_Toothmark_Color / P53_Toothmark_Texture / P54_Toothmark_CNN
+
+    额外（建议）：
+      ROI_Stats: 面积、占比（相对 tg）
     """
 
+    # ---- normalize masks ----
+    norm_masks: Dict[str, Optional[np.ndarray]] = {}
+    for k, v in (roi_masks or {}).items():
+        # 允许把 _debug 等非mask塞进来：直接跳过
+        if not isinstance(v, np.ndarray):
+            continue
+        norm_masks[k] = to_u8_mask(v)
+
     out: Dict[str, Dict[str, float]] = {}
+
+    # ---- optional ROI stats ----
+    if include_roi_stats:
+        tg = norm_masks.get("tg")
+        tg_a = mask_area(tg)
+
+        tai = norm_masks.get("tai")
+        zhi = norm_masks.get("zhi")
+        fissure = norm_masks.get("fissure")
+        tooth_mk = norm_masks.get("tooth_mk")
+
+        stats: Dict[str, float] = {
+            "tg_area": float(tg_a),
+            "tai_area": float(mask_area(tai)),
+            "zhi_area": float(mask_area(zhi)),
+            "fissure_area": float(mask_area(fissure)),
+            "tooth_mk_area": float(mask_area(tooth_mk)),
+            "tai_area_ratio": safe_ratio(mask_area(tai), tg_a),
+            "zhi_area_ratio": safe_ratio(mask_area(zhi), tg_a),
+            "fissure_area_ratio": safe_ratio(mask_area(fissure), tg_a),
+            "tooth_mk_area_ratio": safe_ratio(mask_area(tooth_mk), tg_a),
+        }
+        out["ROI_Stats"] = stats
 
     roi_specs = {
         "tai": (
@@ -228,38 +283,42 @@ def extract_roi_features_all(
         ),
     }
 
+    # safety: ensure model eval
+    if hasattr(p14_model, "eval"):
+        p14_model.eval()
+
     for roi_name, (prefix, t11, t13, t14) in roi_specs.items():
-        mask = roi_masks.get(roi_name)
+        mask = norm_masks.get(roi_name)
         roi_dir = roi_root / roi_name
 
         if mask is None or mask_area(mask) < min_area:
             out[t11] = {}
             out[t13] = {}
-            out[t14] = {f"{prefix}cnnPC{i}": np.nan for i in range(1, 11)}
+            out[t14] = {f"{prefix}cnnPC{i}": float("nan") for i in range(1, 11)}
             continue
 
         # ---- P11 ----
         out[t11] = run_regression_on_roi(
-            infer_regression_fn,
-            roi_dir,
-            sample_id,
-            p11_ckpt,
-            p11_norm,
-            device,
-            p11_dim,
-            prefix,
+            infer_regression_fn=infer_regression_fn,
+            roi_dir=roi_dir,
+            sample_id=sample_id,
+            ckpt_path=p11_ckpt,
+            norm_path=p11_norm,
+            device=device,
+            out_dim=p11_dim,
+            new_prefix=prefix,
         )
 
         # ---- P13 ----
         out[t13] = run_regression_on_roi(
-            infer_regression_fn,
-            roi_dir,
-            sample_id,
-            p13_ckpt,
-            p13_norm,
-            device,
-            p13_dim,
-            prefix,
+            infer_regression_fn=infer_regression_fn,
+            roi_dir=roi_dir,
+            sample_id=sample_id,
+            ckpt_path=p13_ckpt,
+            norm_path=p13_norm,
+            device=device,
+            out_dim=p13_dim,
+            new_prefix=prefix,
         )
 
         # ---- P14 ----

@@ -1,92 +1,89 @@
-# -*- coding: utf-8 -*-
-"""
-Rule-based Tai/Zhi masks from tongue mask.
-
-Inputs:
-  tongue_mask: uint8 HxW (0/1)
-
-Outputs:
-  tai_mask: uint8 HxW (0/1)
-  zhi_mask: uint8 HxW (0/1)
-
-Principle:
-  Use distance transform to split tongue region into inner-core (zhi) and boundary-ring (tai).
-"""
-
+# pipeline/rules/roi_rules_tai_zhi.py
 from __future__ import annotations
-import numpy as np
 import cv2
+import numpy as np
 
+def _to_u8_mask(mask: np.ndarray) -> np.ndarray:
+    """Return uint8 {0,255} mask."""
+    if mask is None:
+        return None
+    if mask.dtype != np.uint8:
+        mask = mask.astype(np.uint8)
+    # allow {0,1} or {0,255}
+    if mask.max() <= 1:
+        mask = mask * 255
+    mask = (mask > 0).astype(np.uint8) * 255
+    return mask
 
-def infer_tai_zhi_from_tongue_mask(
-    tongue_mask: np.ndarray,
-    tai_ratio: float = 0.35,
-    min_area: int = 200,
-    smooth_kernel: int = 3,
-):
+def split_tai_zhi(img_bgr: np.ndarray, tg_mask: np.ndarray, *,
+                  hsv_s_max: int = 80,
+                  hsv_v_min: int = 160,
+                  lab_b_min: int = 145,
+                  min_area_ratio: float = 0.01) -> tuple[np.ndarray, np.ndarray, dict]:
     """
-    Args:
-        tongue_mask: HxW uint8 {0,1} or {0,255}
-        tai_ratio: proportion of tongue pixels to assign to tai (boundary ring).
-                  0.25~0.45 usually works; default 0.35.
-        min_area: minimal area to consider valid; otherwise fallback.
-        smooth_kernel: morphological smoothing (odd number). 0 disables.
-
+    Rule-based split within tongue mask:
+      tai: coating (bright & low saturation OR yellowish)
+      zhi: tg - tai
     Returns:
-        tai_mask, zhi_mask: HxW uint8 {0,1}
+      tai_mask_u8, zhi_mask_u8, debug_dict
     """
-    if tongue_mask is None:
-        raise ValueError("tongue_mask is None")
+    tg = _to_u8_mask(tg_mask)
+    if tg is None or tg.sum() == 0:
+        # no tongue -> no tai/zhi
+        empty = np.zeros(img_bgr.shape[:2], dtype=np.uint8)
+        return empty, empty, {"reason": "empty_tg"}
 
-    tm = (tongue_mask > 0).astype(np.uint8)
-    area = int(tm.sum())
-    if area < min_area:
-        # too small: return empty
-        h, w = tm.shape[:2]
-        return np.zeros((h, w), np.uint8), np.zeros((h, w), np.uint8)
+    h, w = tg.shape
+    roi = img_bgr.copy()
 
-    # optional smoothing to remove small holes/noise
-    if smooth_kernel and smooth_kernel >= 3 and smooth_kernel % 2 == 1:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (smooth_kernel, smooth_kernel))
-        tm = cv2.morphologyEx(tm, cv2.MORPH_CLOSE, k, iterations=1)
-        tm = cv2.morphologyEx(tm, cv2.MORPH_OPEN,  k, iterations=1)
+    # only operate inside tg
+    inside = tg > 0
 
-    # distance transform inside tongue: higher = deeper inside
-    dist = cv2.distanceTransform(tm, distanceType=cv2.DIST_L2, maskSize=5)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    H, S, V = cv2.split(hsv)
+    lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
+    L, A, B = cv2.split(lab)
 
-    # We want tai as boundary ring: select lowest distance pixels within tongue.
-    # Choose threshold by quantile to match tai_ratio.
-    dist_in = dist[tm > 0]
-    if dist_in.size == 0:
-        h, w = tm.shape[:2]
-        return np.zeros((h, w), np.uint8), np.zeros((h, w), np.uint8)
+    # white-coating candidate: low saturation + high value
+    cand_white = (S <= hsv_s_max) & (V >= hsv_v_min)
+    # yellow-coating candidate: b channel high (more yellow)
+    cand_yellow = (B >= lab_b_min) & (L >= 120)  # L constraint avoids dark noise
 
-    # quantile for boundary ring
-    q = np.clip(tai_ratio, 0.05, 0.95)
-    thr = float(np.quantile(dist_in, q))
+    cand = (cand_white | cand_yellow) & inside
+    tai = cand.astype(np.uint8) * 255
 
-    tai = ((dist > 0) & (dist <= thr)).astype(np.uint8)
-    zhi = ((dist > thr)).astype(np.uint8)
+    # morphology cleanup
+    k1 = max(3, int(min(h, w) * 0.01) | 1)   # ~1% size, odd
+    k2 = max(5, int(min(h, w) * 0.02) | 1)   # ~2% size, odd
+    kernel1 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k1, k1))
+    kernel2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k2, k2))
 
-    # ensure both non-empty (fallbacks)
-    tai_area = int(tai.sum())
-    zhi_area = int(zhi.sum())
+    tai = cv2.morphologyEx(tai, cv2.MORPH_OPEN, kernel1, iterations=1)
+    tai = cv2.morphologyEx(tai, cv2.MORPH_CLOSE, kernel2, iterations=1)
 
-    # if tai or zhi becomes empty due to degenerate dist, adjust threshold
-    if tai_area < min_area or zhi_area < min_area:
-        # fallback: use median split
-        thr2 = float(np.quantile(dist_in, 0.50))
-        tai = ((dist > 0) & (dist <= thr2)).astype(np.uint8)
-        zhi = ((dist > thr2)).astype(np.uint8)
-        tai_area = int(tai.sum())
-        zhi_area = int(zhi.sum())
+    # keep within tg strictly
+    tai = (tai > 0) & inside
+    tai = tai.astype(np.uint8) * 255
 
-    # final fallback: if still empty, force split by erosion
-    if tai_area < min_area or zhi_area < min_area:
-        # erode tongue to get core = zhi; ring = tai
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-        core = cv2.erode(tm, k, iterations=1)
-        zhi = (core > 0).astype(np.uint8)
-        tai = ((tm > 0) & (zhi == 0)).astype(np.uint8)
+    # area sanity: if tai too tiny, still keep but you can force empty
+    tg_area = int(inside.sum())
+    tai_area = int((tai > 0).sum())
+    if tg_area > 0 and (tai_area / tg_area) < min_area_ratio:
+        # 可选策略：保留/清空。这里默认“保留”更稳（不丢信息）
+        pass
 
-    return tai.astype(np.uint8), zhi.astype(np.uint8)
+    # zhi = tg - tai
+    zhi = (inside & ~(tai > 0)).astype(np.uint8) * 255
+
+    dbg = {
+        "tg_area": tg_area,
+        "tai_area": tai_area,
+        "tai_area_ratio": float(tai_area) / float(tg_area) if tg_area else 0.0,
+        "params": {
+            "hsv_s_max": hsv_s_max,
+            "hsv_v_min": hsv_v_min,
+            "lab_b_min": lab_b_min,
+            "min_area_ratio": min_area_ratio,
+        }
+    }
+    return tai, zhi, dbg

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict
 import cv2
 import numpy as np
+from src.pipeline.rules.roi_rules_tai_zhi import split_tai_zhi
 
 
 def infer_color_fallback(roi_bgr: np.ndarray) -> Dict[str, Any]:
@@ -35,3 +36,26 @@ def infer_texture_fallback(roi_bgr: np.ndarray) -> Dict[str, Any]:
         "laplacian_var": float(lap.var()),
     }
     return out
+
+def ensure_tai_zhi(img_bgr, roi_masks: dict) -> dict:
+    """
+    roi_masks should at least contain 'tg'. If missing tai/zhi, fill them by rules.
+    """
+    if roi_masks is None:
+        roi_masks = {}
+
+    if "tg" not in roi_masks or roi_masks["tg"] is None:
+        return roi_masks
+
+    need = (roi_masks.get("tai") is None) or (roi_masks.get("zhi") is None)
+    if not need:
+        return roi_masks
+
+    tai, zhi, dbg = split_tai_zhi(img_bgr, roi_masks["tg"])
+    roi_masks["tai"] = tai
+    roi_masks["zhi"] = zhi
+    roi_masks.setdefault("_debug", {})
+    roi_masks["_debug"]["tai_zhi_rules"] = dbg
+    return roi_masks
+
+
