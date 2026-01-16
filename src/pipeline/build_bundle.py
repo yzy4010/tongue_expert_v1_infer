@@ -128,4 +128,17 @@ def build_model_bundle(device: str = "cpu") -> ModelBundle:
         pca=pca,
     )
 
+
+    CKPT_DIR = PROJECT_ROOT / "checkpoints"
+
+    P11_CKPT_PATH = CKPT_DIR / "p11" / "p11_color_best.pth"
+    P11_NORM_PATH = CKPT_DIR / "p11" / "p11_color_norm.json"  # 按你真实文件名改
+    P13_CKPT_PATH = CKPT_DIR / "p13" / "p13_texture_best.pth"
+    P13_NORM_PATH = CKPT_DIR / "p13" / "p13_texture_norm.json"  # 按你真实文件名改
+
+    bundle.p11_ckpt = str(P11_CKPT_PATH)
+    bundle.p11_norm = str(P11_NORM_PATH)
+    bundle.p13_ckpt = str(P13_CKPT_PATH)
+    bundle.p13_norm = str(P13_NORM_PATH)
+
     return bundle

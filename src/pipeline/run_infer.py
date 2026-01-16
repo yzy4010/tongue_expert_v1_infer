@@ -12,6 +12,12 @@ import torch
 
 from src.utils.image_io import read_image_any
 
+from src.pipeline.rules.tongue_regions import split_tongue_regions, build_tissue_regions, roi_area_stats
+
+from src.pipeline.roi_exporter_v2 import export_v2_roi_images
+from src.pipeline.roi_feature_bridge import extract_roi_features_v2
+from src.pipeline.regression_infer import infer_regression as infer_regression_fn
+
 
 # =========================
 # UNet pad/unpad (fix cat mismatch)
@@ -467,6 +473,11 @@ def _classify_tai_color(
             },
         },
     }
+def _get_first_attr(obj, names, default=None):
+    for n in names:
+        if hasattr(obj, n):
+            return getattr(obj, n)
+    return default
 
 
 # =========================
@@ -491,6 +502,11 @@ def infer_one_image(
     device_t = torch.device(device)
 
     PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+    # === P11 / P13 label csv (feature names) ===
+    p11_label_csv = str(PROJECT_ROOT / "data" / "labels" / "p11_tg_color.csv")
+    p13_label_csv = str(PROJECT_ROOT / "data" / "labels" / "p13_tg_texture.csv")
+
     out_root = PROJECT_ROOT / "outputs"
     roi_dir = out_root / "roi" / "test"
     mask_dir = out_root / "pred_masks_original" / "test"
@@ -544,6 +560,114 @@ def infer_one_image(
         lab_b_min=tai_lab_b_min,
     )
     tai_color_cls = _classify_tai_color(img_bgr, tai_mask_255)
+
+    # =========================================================
+    # v2 ROI (minimal set): tongue regions + tissue x region
+    # 说明：
+    # - 不改原项目的 tg/tai/zhi 命名；这里只新增一套 v2 规范命名
+    # - tongue_* 由 tg_mask 生成（PCA 主轴分区）
+    # - coating_* / body_* 由 tai/zhi 与 tongue_* 求交集得到
+    # =========================================================
+
+    # v2 base masks (0/255)
+    tongue_mask_255 = mask_255  # tg
+    coating_mask_255 = tai_mask_255
+    body_mask_255 = zhi_mask_255
+
+    # 1) spatial regions on tongue_mask
+    tongue_regions = split_tongue_regions(
+        tongue_mask_255,
+        ratios=(0.30, 0.40, 0.30),  # tip/center/root
+    )
+
+    # 2) tissue x region (做优：coating_* / body_*)
+    tissue_regions = build_tissue_regions(
+        coating_mask_255,
+        body_mask_255,
+        tongue_regions,
+    )
+
+    # 3) collect v2 roi masks
+    roi_masks_v2 = {
+        "tongue_mask": tongue_mask_255,
+        "coating_mask": coating_mask_255,
+        "body_mask": body_mask_255,
+        **tongue_regions,  # tongue_tip/center/root/left/right
+        **tissue_regions,  # coating_tip.. body_tip..
+    }
+
+    # =========================================================
+    # Step 2 (v2): export ROI images for P11 / P13
+    # 必须在 result 组装之前执行
+    # =========================================================
+    v2_roi_img_paths = export_v2_roi_images(
+        img_bgr=img_bgr,
+        roi_masks_v2=roi_masks_v2,
+        sample_id=sample_id,
+        roi_root=roi_dir,  # outputs/roi/test
+        min_area=200,
+        margin=0.10,
+        save_masked=True,
+    )
+
+    # =========================================================
+    # Step 4: v2 ROI -> P11 / P13 / P14 tables (paper-style)
+    # =========================================================
+
+    # ---- resolve bundle fields (compat) ----
+    p11_ckpt = _get_first_attr(bundle, ["p11_ckpt", "P11_CKPT", "ckpt_p11", "p11_checkpoint"])
+    p11_norm = _get_first_attr(bundle, ["p11_norm", "P11_NORM", "norm_p11", "p11_normalizer"])
+    p11_dim = _get_first_attr(bundle, ["p11_dim", "P11_DIM", "dim_p11"], None)
+
+    p13_ckpt = _get_first_attr(bundle, ["p13_ckpt", "P13_CKPT", "ckpt_p13", "p13_checkpoint"])
+    p13_norm = _get_first_attr(bundle, ["p13_norm", "P13_NORM", "norm_p13", "p13_normalizer"])
+    p13_dim = _get_first_attr(bundle, ["p13_dim", "P13_DIM", "dim_p13"], None)
+
+    p14_model = _get_first_attr(bundle, ["p14_model", "P14_MODEL", "model_p14"])
+    pca = _get_first_attr(bundle, ["pca", "PCA", "p14_pca", "pca_model"])
+
+    tables_v2 = extract_roi_features_v2(
+        img_bgr=img_bgr,
+        roi_masks_v2=roi_masks_v2,
+        sample_id=sample_id,
+        roi_root=roi_dir,
+        device=str(device_t),
+
+        infer_regression_fn=infer_regression_fn,
+
+        p11_ckpt=p11_ckpt,
+        p11_norm=p11_norm,
+        p11_dim=p11_dim,
+
+        p13_ckpt=p13_ckpt,
+        p13_norm=p13_norm,
+        p13_dim=p13_dim,
+
+        p11_label_csv=p11_label_csv,
+        p13_label_csv=p13_label_csv,
+
+        p14_model=p14_model,
+        pca=pca,
+
+    )
+
+    # 4) stats (area & ratio, ratio ref=tongue_mask)
+    roi_stats_v2 = roi_area_stats(roi_masks_v2, ref_key="tongue_mask")
+
+    # 5) optional: save masks for debugging / bridging
+    # 保存到 outputs/analysis 和 outputs/pred_masks_original/test
+    if save_outputs:
+        # analysis_dir / mask_dir 你前面已经创建好了
+        for k, m in roi_masks_v2.items():
+            if not isinstance(m, np.ndarray):
+                continue
+            # 保存到 analysis：方便前端/调试查看
+            p = analysis_dir / f"{sample_id}_{k}.png"
+            cv2.imencode(".png", m)[1].tofile(str(p))
+
+            # 保存到 pred_masks_original：和 tg_mask 同级输出
+            p2 = mask_dir / f"{sample_id}_{k}.png"
+            cv2.imencode(".png", m)[1].tofile(str(p2))
 
     # 再生成 overlay（包含 zhi）
     overlay_img = _draw_roi_overlay(
@@ -757,6 +881,12 @@ def infer_one_image(
                 },
             },
             "tai_zhi_conclusion": tai_zhi_conc,
+            "roi_v2": {
+                "roi_keys": sorted(list(roi_masks_v2.keys())),
+                "stats": roi_stats_v2,
+                "roi_img_paths": v2_roi_img_paths
+            },
+            "tables_v2": tables_v2,
         },
         "interpretation": {
             "summary_cn": summary_cn,

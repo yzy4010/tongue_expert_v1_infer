@@ -111,6 +111,7 @@ def run_regression_on_roi(
     device: str,
     out_dim: Optional[int],
     new_prefix: str,
+    label_csv: Optional[str] = None,
 ) -> Dict[str, float]:
     """
     通用回归入口（P11 / P13 共用）
@@ -126,6 +127,7 @@ def run_regression_on_roi(
         ids=[sample_id],
         device=device,
         out_dim_override=out_dim,
+        label_csv=label_csv,
     )
 
     if len(used_ids) == 0:
@@ -210,6 +212,8 @@ def extract_roi_features_all(
 
     min_area: int = 200,
     include_roi_stats: bool = True,
+    p11_label_csv: Optional[str] = None,  # ✅ 新增
+    p13_label_csv: Optional[str] = None,  # ✅ 新增
 ) -> Dict[str, Dict[str, float]]:
     """
     对单个样本，输出论文级表结构：
@@ -307,6 +311,7 @@ def extract_roi_features_all(
             device=device,
             out_dim=p11_dim,
             new_prefix=prefix,
+            label_csv=p11_label_csv,
         )
 
         # ---- P13 ----
@@ -319,6 +324,7 @@ def extract_roi_features_all(
             device=device,
             out_dim=p13_dim,
             new_prefix=prefix,
+            label_csv=p13_label_csv,  # ✅ 新增
         )
 
         # ---- P14 ----
@@ -332,3 +338,140 @@ def extract_roi_features_all(
         )
 
     return out
+
+# ============================================================
+# v2 minimal-set ROI tables (coating_* / body_*)
+# ============================================================
+
+def _v2_roi_specs_minimal():
+    """
+    v2 最小集合：仅对 coating_* 与 body_* 五分区输出论文表结构（P60_*）
+    ROI 工程命名不带 P60；P60 只在 table key 中出现。
+    """
+    specs = {}
+
+    parts = [
+        ("tip", "Tip"),
+        ("center", "Center"),
+        ("root", "Root"),
+        ("left", "Left"),
+        ("right", "Right"),
+    ]
+
+    # coating
+    for part, cname in parts:
+        roi_key = f"coating_{part}"
+        prefix = f"coating_{part}_"
+        specs[roi_key] = (
+            prefix,
+            f"P60_Coating{cname}_Color",
+            f"P60_Coating{cname}_Texture",
+            f"P60_Coating{cname}_CNN",
+        )
+
+    # body
+    for part, cname in parts:
+        roi_key = f"body_{part}"
+        prefix = f"body_{part}_"
+        specs[roi_key] = (
+            prefix,
+            f"P60_Body{cname}_Color",
+            f"P60_Body{cname}_Texture",
+            f"P60_Body{cname}_CNN",
+        )
+
+    return specs
+
+
+def extract_roi_features_v2(
+    *,
+    img_bgr: np.ndarray,
+    roi_masks_v2: Dict[str, np.ndarray],
+    sample_id: str,
+    roi_root: Path,
+    device: str,
+
+    infer_regression_fn: Callable,
+
+    # -------- P11 --------
+    p11_ckpt: str,
+    p11_norm: str,
+    p11_dim: Optional[int],
+
+    # -------- P13 --------
+    p13_ckpt: str,
+    p13_norm: str,
+    p13_dim: Optional[int],
+
+    # -------- P14 --------
+    p14_model,
+    pca,
+
+    min_area: int = 200,
+
+    p11_label_csv: Optional[str] = None,
+    p13_label_csv: Optional[str] = None,
+
+) -> Dict[str, Dict[str, float]]:
+    """
+    v2 最小集合（coating/body × tip/center/root/left/right）：
+    输出论文表结构 tables，用于 JSON：
+      P60_CoatingTip_Color / Texture / CNN
+      P60_BodyLeft_Color / Texture / CNN
+      ...
+
+    注意：
+    - P11/P13 从 roi_root/<roi_key>/<id>.jpg 读取（必须先 export）
+    - P14 直接用 img + mask 做 embedding（不依赖 roi_dir）
+    """
+    out: Dict[str, Dict[str, float]] = {}
+    roi_specs = _v2_roi_specs_minimal()
+
+    for roi_key, (prefix, t11, t13, t14) in roi_specs.items():
+        mask = roi_masks_v2.get(roi_key)
+        roi_dir = Path(roi_root) / roi_key
+
+        if mask is None or mask_area(mask) < min_area:
+            out[t11] = {}
+            out[t13] = {}
+            out[t14] = {f"{prefix}cnnPC{i}": np.nan for i in range(1, 11)}
+            continue
+
+        # ---- P11 (Color regression) ----
+        out[t11] = run_regression_on_roi(
+            infer_regression_fn=infer_regression_fn,
+            roi_dir=roi_dir,
+            sample_id=sample_id,
+            ckpt_path=p11_ckpt,
+            norm_path=p11_norm,
+            device=device,
+            out_dim=p11_dim,
+            new_prefix=prefix,
+            label_csv=p11_label_csv,
+        )
+
+        # ---- P13 (Texture regression) ----
+        out[t13] = run_regression_on_roi(
+            infer_regression_fn=infer_regression_fn,
+            roi_dir=roi_dir,
+            sample_id=sample_id,
+            ckpt_path=p13_ckpt,
+            norm_path=p13_norm,
+            device=device,
+            out_dim=p13_dim,
+            new_prefix=prefix,
+            label_csv=p13_label_csv,
+        )
+
+        # ---- P14 (Embedding -> PCA) ----
+        out[t14] = run_p14_on_roi(
+            img_bgr=img_bgr,
+            mask=mask,
+            p14_model=p14_model,
+            pca=pca,
+            new_prefix=prefix,
+            device=device,
+        )
+
+    return out
+
